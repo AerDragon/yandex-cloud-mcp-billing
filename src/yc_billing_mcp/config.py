@@ -23,7 +23,7 @@ class Settings:
     sa_key_file: str | None
     sa_key_json: str | None
     workload_token_file: str | None
-    workload_audience: str | None
+    workload_sa_id: str | None
     use_metadata: bool
 
     # API
@@ -33,6 +33,7 @@ class Settings:
     workload_endpoint: str
     metadata_endpoint: str
     default_currency: str
+    default_billing_account_id: str | None
     usage_cache_ttl: float
     fx_url: str
     fx_cache_ttl: float
@@ -57,7 +58,7 @@ class Settings:
             sa_key_file=os.getenv("YC_SA_KEY_FILE"),
             sa_key_json=os.getenv("YC_SA_KEY_JSON"),
             workload_token_file=os.getenv("YC_WORKLOAD_TOKEN_FILE"),
-            workload_audience=os.getenv("YC_WORKLOAD_AUDIENCE"),
+            workload_sa_id=os.getenv("YC_WORKLOAD_SA_ID"),
             use_metadata=_env_bool("YC_USE_METADATA"),
             billing_endpoint=os.getenv(
                 "YC_BILLING_ENDPOINT", "https://billing.api.cloud.yandex.net"
@@ -76,6 +77,7 @@ class Settings:
                 "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
             ),
             default_currency=os.getenv("YC_DEFAULT_CURRENCY", "RUB"),
+            default_billing_account_id=os.getenv("YC_BILLING_ACCOUNT_ID") or None,
             usage_cache_ttl=float(os.getenv("YC_USAGE_CACHE_TTL", "300")),
             fx_url=os.getenv(
                 "FX_RATES_URL", "https://www.cbr-xml-daily.ru/daily_json.js"

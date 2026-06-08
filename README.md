@@ -66,9 +66,9 @@ The server picks the first auth method whose env var is set, in this priority:
 3. `YC_SA_KEY_FILE` — path to the same JSON on disk.
 4. `YC_WORKLOAD_TOKEN_FILE` — path to a projected OIDC token (Kubernetes Workload
    Identity Federation). The token is exchanged at
-   `https://auth.yandex.cloud/oauth/token`. **`YC_WORKLOAD_AUDIENCE` is required** —
-   set it to the YC *service account id* (not the federation id) that should receive
-   the IAM token. That SA must have a federated credential whose `external_subject_id`
+   `https://auth.yandex.cloud/oauth/token`. **`YC_WORKLOAD_SA_ID` is required** — the
+   target YC service account id (not the federation id) that should receive the IAM
+   token. That SA must have a federated credential whose `external_subject_id`
    matches the JWT's `sub` claim.
 5. `YC_OAUTH_TOKEN` — Yandex Passport OAuth token, exchanged for an IAM token.
 6. `YC_USE_METADATA=true` — read the IAM token from the Compute instance metadata
@@ -146,7 +146,7 @@ spec:
       image: ghcr.io/your-org/yc-billing-mcp:latest
       env:
         - { name: YC_WORKLOAD_TOKEN_FILE, value: /var/run/secrets/tokens/yc-token }
-        - { name: YC_WORKLOAD_AUDIENCE,   value: "https://yc.example/federations/<fed-id>" }
+        - { name: YC_WORKLOAD_SA_ID,      value: "ajeXXXXXXXXXXXXXX" }   # target YC SA
         - { name: MCP_HOST,               value: "0.0.0.0" }
       volumeMounts:
         - name: yc-token

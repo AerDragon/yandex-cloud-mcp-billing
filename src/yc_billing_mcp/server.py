@@ -115,6 +115,19 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             }
         return resp
 
+    def _resolve_account(billing_account_id: str | None) -> str:
+        """Resolve the target billing account id: explicit arg wins, otherwise
+        fall back to the server default (YC_BILLING_ACCOUNT_ID env). Raise a
+        clear error if neither is set."""
+        resolved = billing_account_id or settings.default_billing_account_id
+        if not resolved:
+            raise ValueError(
+                "billing_account_id is not provided and no server default is "
+                "configured. Either pass it explicitly to the tool, or set the "
+                "YC_BILLING_ACCOUNT_ID environment variable on the server."
+            )
+        return resolved
+
     mcp = FastMCP(
         name="yandex-cloud-billing",
         instructions=(
@@ -137,6 +150,16 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             "current rate table or convert_amount for one-off math.\n\n"
             "The spend_* tools call a rate-limited gRPC API "
             f"(~1 request per minute per IP); responses are cached for {settings.usage_cache_ttl:.0f}s."
+            + (
+                "\n\nThe server has a default billing account configured "
+                f"(`{settings.default_billing_account_id}`) — you can omit "
+                "`billing_account_id` from spend_* calls unless the user asks "
+                "about a different account."
+                if settings.default_billing_account_id
+                else "\n\nNo default billing account is configured — pass "
+                "`billing_account_id` to every spend_* call. If the user "
+                "doesn't know it, ask them."
+            )
         ),
         host=settings.host,
         port=settings.port,
@@ -181,18 +204,18 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             "credits and expense, plus a time series at the chosen aggregation."
         )
     )
-    async def spend_summary(
-        billing_account_id: str,
-        from_date: Annotated[
+    async def spend_summary(        from_date: Annotated[
             str, Field(description="Inclusive start date (YYYY-MM-DD or ISO 8601).")
         ],
         to_date: Annotated[
             str, Field(description="Inclusive end date (YYYY-MM-DD or ISO 8601).")
         ],
+
+        billing_account_id: str | None = None,
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
         return await _attach_spend_fx(await usage.billing_account_report(
-            billing_account_id=billing_account_id,
+            billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,
             to_date=to_date,
             aggregation_period=aggregation_period,
@@ -205,10 +228,10 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             "in this period'. Optionally filter by cloud/folder/service ids."
         )
     )
-    async def spend_by_service(
-        billing_account_id: str,
-        from_date: str,
+    async def spend_by_service(        from_date: str,
         to_date: str,
+
+        billing_account_id: str | None = None,
         service_ids: Annotated[
             list[str] | None,
             Field(description="Optional whitelist of service ids to include."),
@@ -218,7 +241,7 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
         return await _attach_spend_fx(await usage.service_report(
-            billing_account_id=billing_account_id,
+            billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,
             to_date=to_date,
             service_ids=service_ids,
@@ -233,16 +256,16 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             "which cloud (i.e. tenant/project) is driving spend."
         )
     )
-    async def spend_by_cloud(
-        billing_account_id: str,
-        from_date: str,
+    async def spend_by_cloud(        from_date: str,
         to_date: str,
+
+        billing_account_id: str | None = None,
         cloud_ids: list[str] | None = None,
         service_ids: list[str] | None = None,
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
         return await _attach_spend_fx(await usage.cloud_report(
-            billing_account_id=billing_account_id,
+            billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,
             to_date=to_date,
             cloud_ids=cloud_ids,
@@ -256,17 +279,17 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             "a project inside a cloud). Use to attribute spend to teams/projects."
         )
     )
-    async def spend_by_folder(
-        billing_account_id: str,
-        from_date: str,
+    async def spend_by_folder(        from_date: str,
         to_date: str,
+
+        billing_account_id: str | None = None,
         folder_ids: list[str] | None = None,
         cloud_ids: list[str] | None = None,
         service_ids: list[str] | None = None,
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
         return await _attach_spend_fx(await usage.folder_report(
-            billing_account_id=billing_account_id,
+            billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,
             to_date=to_date,
             folder_ids=folder_ids,
@@ -281,10 +304,10 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             "know which exact line items (e.g. vCPU vs RAM vs egress) drive the cost."
         )
     )
-    async def spend_by_sku(
-        billing_account_id: str,
-        from_date: str,
+    async def spend_by_sku(        from_date: str,
         to_date: str,
+
+        billing_account_id: str | None = None,
         sku_ids: list[str] | None = None,
         service_ids: list[str] | None = None,
         cloud_ids: list[str] | None = None,
@@ -292,7 +315,7 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
         return await _attach_spend_fx(await usage.sku_report(
-            billing_account_id=billing_account_id,
+            billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,
             to_date=to_date,
             sku_ids=sku_ids,
@@ -308,10 +331,10 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             "clusters, …). Useful for hunting cost outliers."
         )
     )
-    async def spend_by_resource(
-        billing_account_id: str,
-        from_date: str,
+    async def spend_by_resource(        from_date: str,
         to_date: str,
+
+        billing_account_id: str | None = None,
         resource_ids: list[str] | None = None,
         service_ids: list[str] | None = None,
         folder_ids: list[str] | None = None,
@@ -319,7 +342,7 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
         return await _attach_spend_fx(await usage.resource_report(
-            billing_account_id=billing_account_id,
+            billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,
             to_date=to_date,
             resource_ids=resource_ids,
@@ -336,10 +359,10 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             "to OR them instead of AND."
         )
     )
-    async def spend_by_label(
-        billing_account_id: str,
-        from_date: str,
+    async def spend_by_label(        from_date: str,
         to_date: str,
+
+        billing_account_id: str | None = None,
         labels: Annotated[
             dict[str, list[str]] | None,
             Field(
@@ -356,7 +379,7 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
         return await _attach_spend_fx(await usage.label_key_report(
-            billing_account_id=billing_account_id,
+            billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,
             to_date=to_date,
             labels=labels,

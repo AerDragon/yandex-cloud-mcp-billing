@@ -113,10 +113,11 @@ class WorkloadIdentityProvider(_CachedTokenProvider):
     """Exchange a Kubernetes-issued OIDC token for a Yandex Cloud IAM token via
     Workload Identity Federation.
 
-    YC requires the request to carry the *target service account id* as the
-    `audience` form parameter (not the federation id, not the OIDC audience —
-    the SA id of the YC service account the IAM token should be minted for).
-    See https://yandex.cloud/en/docs/iam/operations/wlif/setup-wlif
+    Note on naming: the OAuth2 token-exchange form parameter is literally
+    called `audience`, but in YC's flow its *value* is the target service
+    account id — the SA that should receive the minted IAM token. That SA
+    must have a federated credential whose `external_subject_id` matches the
+    JWT's `sub` claim. See https://yandex.cloud/en/docs/iam/operations/wlif/setup-wlif
     """
 
     def __init__(
@@ -124,18 +125,18 @@ class WorkloadIdentityProvider(_CachedTokenProvider):
         token_file: str,
         http: httpx.AsyncClient,
         endpoint: str,
-        audience: str,
+        sa_id: str,
     ) -> None:
-        if not audience:
+        if not sa_id:
             raise ValueError(
-                "WorkloadIdentityProvider requires `audience` = target YC service "
-                "account id. Set YC_WORKLOAD_AUDIENCE."
+                "WorkloadIdentityProvider requires `sa_id` — the YC service "
+                "account id to mint IAM tokens for. Set YC_WORKLOAD_SA_ID."
             )
         super().__init__()
         self._token_file = Path(token_file)
         self._http = http
         self._endpoint = endpoint
-        self._audience = audience
+        self._sa_id = sa_id
 
     async def _fetch(self) -> tuple[str, int]:
         # Re-read the file each refresh — kubelet rotates the projected token
@@ -146,7 +147,7 @@ class WorkloadIdentityProvider(_CachedTokenProvider):
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-            "audience": self._audience,
+            "audience": self._sa_id,
             "subject_token": subject,
         }
         r = await self._http.post(
@@ -204,7 +205,7 @@ def make_provider(settings: Settings, http: httpx.AsyncClient) -> IamTokenProvid
             settings.workload_token_file,
             http,
             settings.workload_endpoint,
-            settings.workload_audience,
+            settings.workload_sa_id,
         )
     if settings.oauth_token:
         log.info("Auth: OAuth token (YC_OAUTH_TOKEN)")
