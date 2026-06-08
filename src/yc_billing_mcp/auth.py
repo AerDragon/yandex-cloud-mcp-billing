@@ -110,16 +110,27 @@ class ServiceAccountKeyProvider(_CachedTokenProvider):
 
 
 class WorkloadIdentityProvider(_CachedTokenProvider):
-    """Exchange a Kubernetes-issued OIDC/JWT token for an IAM token via
-    Yandex Cloud Workload Identity Federation."""
+    """Exchange a Kubernetes-issued OIDC token for a Yandex Cloud IAM token via
+    Workload Identity Federation.
+
+    YC requires the request to carry the *target service account id* as the
+    `audience` form parameter (not the federation id, not the OIDC audience —
+    the SA id of the YC service account the IAM token should be minted for).
+    See https://yandex.cloud/en/docs/iam/operations/wlif/setup-wlif
+    """
 
     def __init__(
         self,
         token_file: str,
         http: httpx.AsyncClient,
         endpoint: str,
-        audience: str | None = None,
+        audience: str,
     ) -> None:
+        if not audience:
+            raise ValueError(
+                "WorkloadIdentityProvider requires `audience` = target YC service "
+                "account id. Set YC_WORKLOAD_AUDIENCE."
+            )
         super().__init__()
         self._token_file = Path(token_file)
         self._http = http
@@ -135,10 +146,9 @@ class WorkloadIdentityProvider(_CachedTokenProvider):
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+            "audience": self._audience,
             "subject_token": subject,
         }
-        if self._audience:
-            data["audience"] = self._audience
         r = await self._http.post(
             self._endpoint,
             data=data,
