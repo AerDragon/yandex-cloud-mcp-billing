@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 import httpx
@@ -18,6 +20,83 @@ from .usage import UsageClient
 log = logging.getLogger(__name__)
 
 AggregationPeriod = Literal["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"]
+
+# A label key with more distinct values than this is "high cardinality" — grouping
+# by it produces thousands of rows (e.g. managed-kubernetes-node-group-id). Flagged
+# in list_label_keys so the caller filters/scopes instead of grouping blindly.
+HIGH_CARDINALITY_THRESHOLD = 200
+
+
+def _amount(d: Any, key: str) -> str:
+    v = d.get(key) if isinstance(d, dict) else None
+    return v.get("value", "0") if isinstance(v, dict) else "0"
+
+
+def _to_float(s: str) -> float:
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _too_many_values_response(
+    label_key: str, raw: dict[str, Any], value_count: int
+) -> dict[str, Any]:
+    """High-cardinality backstop for spend_grouped_by_label. When the full breakdown
+    would exceed the response budget, return a summary the LLM can ACT on — the
+    complete total + count, plus concrete, parameter-named ways to narrow — instead
+    of truncating rows (silent loss) or sampling top-N (hidden tail). Validated
+    against an LLM (3/3 intents recover correctly: coarser key for chargeback, scope
+    for genuine per-value detail). NOT raised as an error: the query succeeded and
+    the total is real — an error frame makes the model give up rather than narrow."""
+    out: dict[str, Any] = {
+        "label_key": label_key,
+        "status": "too_many_values_to_list",
+        "currency": raw.get("currency"),
+        "total": raw.get("cost"),
+        "value_count": value_count,
+        "message": (
+            f"This label key has {value_count} distinct values — the full per-value "
+            "breakdown exceeds the response size limit and is NOT listed. The total "
+            "above is complete and correct. To get a usable breakdown, narrow the "
+            "query and call again:"
+        ),
+        "how_to_narrow": [
+            "GROUP BY A COARSER KEY: call spend_grouped_by_label with a "
+            "lower-cardinality label_key (e.g. 'project', 'team'). Use list_label_keys "
+            "to see which keys exist and their cardinality.",
+            "SCOPE TO A SUBSET: call spend_grouped_by_label with the SAME label_key "
+            "plus service_ids / folder_ids / cloud_ids to restrict to one service / "
+            "folder / cloud (far fewer values).",
+            f'NAME SPECIFIC VALUES: spend_by_label(labels={{"{label_key}": ["<value>"]}}) '
+            "if you already know the value ids.",
+        ],
+    }
+    if raw.get("display"):
+        out["display"] = raw["display"]
+    return out
+
+
+def _compact_entity_row(e: dict[str, Any]) -> dict[str, Any]:
+    """Project one verbose ConsumptionCore entity row to a compact line: the label
+    value + cost, plus expense ONLY when it differs from cost (credits applied) and
+    the non-zero credit components ONLY when present. Lossless for the signal that
+    matters; drops the all-zero credit padding that bloats the raw shape ~5x."""
+    out: dict[str, Any] = {
+        "value": (e.get("label") or {}).get("value"),
+        "cost": _amount(e, "cost"),
+    }
+    expense = _amount(e, "expense")
+    if expense != out["cost"]:
+        out["expense"] = expense
+    credits = {
+        k: v.get("value")
+        for k, v in (e.get("credit_details") or {}).items()
+        if isinstance(v, dict) and _to_float(v.get("value", "0")) != 0
+    }
+    if credits:
+        out["credits"] = credits
+    return out
 
 
 class DisplayCurrencyState:
@@ -395,20 +474,25 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
 
     @mcp.tool(
         description=(
-            "Spend grouped by a resource label key (cost-allocation style). Pass "
-            "the labels filter as a dict of key→value; set labels_or_filter_logic=true "
-            "to OR them instead of AND."
+            "Spend for resources matching a SPECIFIC label filter (verbose, "
+            "per-label-value rows). Pass `labels` as {key: [values]} (e.g. "
+            "{\"project\": [\"commerce-pricing\"]}) and/or a service_ids / folder_ids "
+            "/ cloud_ids scope. A filter OR scope is REQUIRED — an unfiltered call "
+            "would enumerate every label key×value in the account (thousands of rows). "
+            "To break a single key into its values (e.g. cost per project) use "
+            "spend_grouped_by_label; to discover which label keys exist use "
+            "list_label_keys."
         )
     )
-    async def spend_by_label(        from_date: str,
+    async def spend_by_label(
+        from_date: str,
         to_date: str,
-
         billing_account_id: str | None = None,
         labels: Annotated[
             dict[str, list[str]] | None,
             Field(
                 description=(
-                    "Optional label filter — map of key → list of allowed values. "
+                    "Label filter — map of key → list of allowed values. "
                     "Example: {\"team\": [\"data\", \"platform\"], \"env\": [\"prod\"]}."
                 )
             ),
@@ -419,6 +503,14 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
         folder_ids: list[str] | None = None,
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
+        if not labels and not service_ids and not folder_ids and not cloud_ids:
+            raise ValueError(
+                "spend_by_label needs a `labels` filter or a service_ids / folder_ids "
+                "/ cloud_ids scope — an unfiltered label report enumerates every label "
+                "key×value in the account (thousands of rows, megabytes). To get cost "
+                "broken down by ONE key's values use spend_grouped_by_label(label_key=…); "
+                "to see which label keys exist use list_label_keys."
+            )
         return await _attach_spend_fx(await usage.label_key_report(
             billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,
@@ -430,6 +522,139 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             folder_ids=folder_ids,
             aggregation_period=aggregation_period,
         ))
+
+    @mcp.tool(
+        description=(
+            "Spend broken down by the values of ONE label key — the cost-allocation / "
+            "chargeback workhorse (e.g. label_key=\"project\" → cost per project, "
+            "label_key=\"team\" → cost per team). Returns the FULL breakdown in a COMPACT "
+            "shape (value + cost, plus expense/credits only when non-trivial), sorted by "
+            "cost descending — no truncation, `total` matches the sum of the breakdown. "
+            "For low/medium-cardinality keys (project, team, cluster_id) this is small. "
+            "Do NOT group by a key flagged high_cardinality in list_label_keys (thousands "
+            "of values) — filter or scope with service_ids / folder_ids / cloud_ids "
+            "instead. Use list_label_keys first if you don't know which keys exist."
+        )
+    )
+    async def spend_grouped_by_label(
+        label_key: Annotated[
+            str,
+            Field(description="The single label key to group by, e.g. \"project\"."),
+        ],
+        from_date: str,
+        to_date: str,
+        billing_account_id: str | None = None,
+        service_ids: list[str] | None = None,
+        folder_ids: list[str] | None = None,
+        cloud_ids: list[str] | None = None,
+        aggregation_period: AggregationPeriod = "MONTH",
+    ) -> dict[str, Any]:
+        if not label_key:
+            raise ValueError("label_key is required, e.g. label_key=\"project\".")
+        # An empty values list for a key = "all values of this key" — the API's
+        # group-by-single-key idiom, verified against ConsumptionCore.
+        raw = await usage.label_key_report(
+            billing_account_id=_resolve_account(billing_account_id),
+            from_date=from_date,
+            to_date=to_date,
+            labels={label_key: []},
+            service_ids=service_ids,
+            folder_ids=folder_ids,
+            cloud_ids=cloud_ids,
+            aggregation_period=aggregation_period,
+        )
+        await _attach_spend_fx(raw)
+        rows = [e for e in (raw.get("entities_data") or []) if isinstance(e, dict)]
+        # Stateless: return the FULL breakdown (no cap / no pagination — the MCP may run
+        # as several replicas, so any cursor/top-N that depends on a per-instance cache
+        # would be inconsistent across calls). Sort cost desc, value asc as a stable
+        # tiebreak so the output order is deterministic. High-cardinality keys are kept
+        # out of scope by the list_label_keys `high_cardinality` flag, not by truncation.
+        rows.sort(
+            key=lambda e: (
+                -_to_float(_amount(e, "cost")),
+                (e.get("label") or {}).get("value") or "",
+            )
+        )
+        out: dict[str, Any] = {
+            "label_key": label_key,
+            "currency": raw.get("currency"),
+            "total": raw.get("cost"),
+            "value_count": len(rows),
+            "breakdown": [_compact_entity_row(e) for e in rows],
+        }
+        if raw.get("display"):
+            out["display"] = raw["display"]
+        # High-cardinality backstop (stateless — single call, replica-safe): if the
+        # full breakdown would exceed the response budget it would be silently
+        # truncated by the caller's tool-output token limit. Instead of truncating
+        # (silent data loss) or sampling (top-N hides the tail), return a summary the
+        # LLM can act on — the complete `total` + `value_count` + concrete ways to
+        # narrow. Empirically (Codex, 3/3 intents) the LLM reads this and recovers:
+        # coarser key for chargeback, scope for genuine per-value detail.
+        if len(json.dumps(out, ensure_ascii=False)) > settings.grouped_max_bytes:
+            out = _too_many_values_response(label_key, raw, len(rows))
+        return out
+
+    @mcp.tool(
+        description=(
+            "Discover which resource label keys exist (and how concentrated each is) "
+            "so you can pick one for spend_grouped_by_label / spend_by_label. Returns a "
+            "compact digest [{key, distinct_values, total_cost, high_cardinality}] over "
+            "a recent window (defaults to the last few days; label keys are stable, so a "
+            "recent snapshot reflects the current set). Keys flagged high_cardinality "
+            "(e.g. per-node-group ids) should be filtered/scoped, not grouped wholesale."
+        )
+    )
+    async def list_label_keys(
+        billing_account_id: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        service_ids: list[str] | None = None,
+        folder_ids: list[str] | None = None,
+        cloud_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        # Default to a short recent window — keys are stable, and an unfiltered label
+        # report over a long range is huge. Caller-supplied dates are honoured but a
+        # scope is recommended for long ranges.
+        if not from_date or not to_date:
+            today = datetime.now(timezone.utc).date()
+            from_date = (today - timedelta(days=2)).isoformat()
+            to_date = today.isoformat()
+        raw = await usage.label_key_report(
+            billing_account_id=_resolve_account(billing_account_id),
+            from_date=from_date,
+            to_date=to_date,
+            service_ids=service_ids,
+            folder_ids=folder_ids,
+            cloud_ids=cloud_ids,
+            aggregation_period="MONTH",
+        )
+        agg: dict[str, dict[str, float | int]] = {}
+        for e in raw.get("entities_data") or []:
+            if not isinstance(e, dict):
+                continue
+            k = (e.get("label") or {}).get("key")
+            if not k:
+                continue
+            slot = agg.setdefault(k, {"distinct_values": 0, "total_cost": 0.0})
+            slot["distinct_values"] += 1
+            slot["total_cost"] += _to_float(_amount(e, "cost"))
+        keys = [
+            {
+                "key": k,
+                "distinct_values": v["distinct_values"],
+                "total_cost": f"{v['total_cost']:.4f}",
+                "high_cardinality": v["distinct_values"] > HIGH_CARDINALITY_THRESHOLD,
+            }
+            for k, v in agg.items()
+        ]
+        keys.sort(key=lambda r: _to_float(r["total_cost"]), reverse=True)
+        return {
+            "currency": raw.get("currency"),
+            "window": {"from": from_date, "to": to_date},
+            "label_keys": keys,
+        }
 
     # ----- Currency / FX -----
 

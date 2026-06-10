@@ -70,6 +70,49 @@ def _agg(name: str | None) -> int:
     return _AGG_VALUES[upper]
 
 
+def _amount(d: Any, key: str) -> str:
+    v = d.get(key) if isinstance(d, dict) else None
+    return v.get("value", "0") if isinstance(v, dict) else "0"
+
+
+def _periodic_matches_row(row: dict[str, Any], bucket: dict[str, Any]) -> bool:
+    """True iff a single periodic bucket carries exactly the same cost / expense /
+    credit_details as its parent row — i.e. it is pure duplication and can be dropped
+    without losing information. Compared field-by-field, not by object identity."""
+    if _amount(row, "cost") != _amount(bucket, "cost"):
+        return False
+    if _amount(row, "expense") != _amount(bucket, "expense"):
+        return False
+    rc = row.get("credit_details") or {}
+    bc = bucket.get("credit_details") or {}
+    if set(rc) != set(bc):
+        return False
+    for k in rc:
+        if _amount(rc, k) != _amount(bc, k):
+            return False
+    return True
+
+
+def _collapse_redundant_periodic(obj: Any) -> None:
+    """LOSSLESS in-place slimming: drop a row's `periodic` array ONLY when it is a
+    single bucket that exactly duplicates the row's own cost/expense/credit_details
+    (the common case for MONTH-over-one-month reports). A multi-bucket series
+    (DAY/WEEK aggregation) or a bucket that differs from the row is KEPT untouched —
+    it carries the time breakdown. The only thing dropped is the redundant bucket's
+    `timestamp`, which equals the query window and is derivable. Recurses through the
+    whole response so it applies uniformly to every report shape."""
+    if isinstance(obj, dict):
+        per = obj.get("periodic")
+        if isinstance(per, list) and len(per) <= 1:
+            if not per or _periodic_matches_row(obj, per[0]):
+                obj.pop("periodic", None)
+        for v in obj.values():
+            _collapse_redundant_periodic(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collapse_redundant_periodic(v)
+
+
 class UsageApiError(Exception):
     def __init__(self, code: grpc.StatusCode | None, details: str) -> None:
         super().__init__(f"Usage API error ({code}): {details}")
@@ -210,6 +253,7 @@ class UsageClient:
                 ) from None
             raise UsageApiError(code, e.details() or str(e)) from None
         result = MessageToDict(resp, preserving_proto_field_name=True)
+        _collapse_redundant_periodic(result)
         self._cache_put(key, result)
         return result
 

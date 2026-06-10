@@ -36,6 +36,7 @@ class Settings:
     default_billing_account_id: str | None
     usage_cache_ttl: float
     usage_rpc_timeout: float
+    grouped_max_bytes: int
     fx_url: str
     fx_cache_ttl: float
     default_display_currency: str
@@ -88,6 +89,14 @@ class Settings:
             # (commonly ~10-15s), set this BELOW that proxy timeout so the actionable
             # gRPC error reaches the client before the proxy kills the connection.
             usage_rpc_timeout=float(os.getenv("YC_USAGE_RPC_TIMEOUT", "30")),
+            # Max serialized size of a spend_grouped_by_label response. A group-by
+            # over a HIGH-CARDINALITY key (e.g. per-node-group ids, thousands of
+            # values) would exceed the LLM's tool-output token limit and be silently
+            # truncated. Over budget, the tool returns a `too_many_values_to_list`
+            # summary (total + count + how to narrow) instead — never truncated rows.
+            # ~40KB sits under a typical 16K-token (~56KB) limit with headroom; real
+            # business keys (project/team/cluster) are far smaller and never trip it.
+            grouped_max_bytes=int(os.getenv("YC_GROUPED_MAX_BYTES", "40000")),
             fx_url=os.getenv(
                 "FX_RATES_URL", "https://www.cbr-xml-daily.ru/daily_json.js"
             ),
