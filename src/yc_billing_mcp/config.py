@@ -35,6 +35,7 @@ class Settings:
     default_currency: str
     default_billing_account_id: str | None
     usage_cache_ttl: float
+    usage_rpc_timeout: float
     fx_url: str
     fx_cache_ttl: float
     default_display_currency: str
@@ -79,6 +80,14 @@ class Settings:
             default_currency=os.getenv("YC_DEFAULT_CURRENCY", "RUB"),
             default_billing_account_id=os.getenv("YC_BILLING_ACCOUNT_ID") or None,
             usage_cache_ttl=float(os.getenv("YC_USAGE_CACHE_TTL", "300")),
+            # Per-call gRPC deadline for Usage API reports. Filtered/scoped reports
+            # complete in <2s; an UNFILTERED account-wide label/SKU report can take
+            # 12s+ and balloon the response. The deadline turns such a runaway into a
+            # clean "narrow your query" error instead of an unbounded hang. If a
+            # reverse proxy fronts this MCP and terminates the HTTP connection earlier
+            # (commonly ~10-15s), set this BELOW that proxy timeout so the actionable
+            # gRPC error reaches the client before the proxy kills the connection.
+            usage_rpc_timeout=float(os.getenv("YC_USAGE_RPC_TIMEOUT", "30")),
             fx_url=os.getenv(
                 "FX_RATES_URL", "https://www.cbr-xml-daily.ru/daily_json.js"
             ),

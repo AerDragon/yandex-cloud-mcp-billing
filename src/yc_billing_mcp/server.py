@@ -47,6 +47,7 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
         provider,
         endpoint=settings.usage_endpoint,
         cache_ttl_seconds=settings.usage_cache_ttl,
+        rpc_timeout_seconds=settings.usage_rpc_timeout,
     )
     fx = FxRates(
         CbrFxProvider(http, url=settings.fx_url),
@@ -300,18 +301,34 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
 
     @mcp.tool(
         description=(
-            "Spend broken down by SKU. Use after spend_by_service when you need to "
-            "know which exact line items (e.g. vCPU vs RAM vs egress) drive the cost."
+            "Spend broken down by SKU (line items, e.g. vCPU vs RAM vs storage vs "
+            "egress). Use after spend_by_service to see what drives a service's cost. "
+            "To get the SKU breakdown for ONE cluster / project / team, pass a `labels` "
+            "filter (e.g. {\"project\": [\"clickhouse-commerce-pricing\"]}) or "
+            "`resource_ids` / `service_ids` — without a filter this returns every SKU "
+            "in the whole billing account, which is large and slow."
         )
     )
-    async def spend_by_sku(        from_date: str,
+    async def spend_by_sku(
+        from_date: str,
         to_date: str,
-
         billing_account_id: str | None = None,
         sku_ids: list[str] | None = None,
         service_ids: list[str] | None = None,
         cloud_ids: list[str] | None = None,
         folder_ids: list[str] | None = None,
+        resource_ids: list[str] | None = None,
+        labels: Annotated[
+            dict[str, list[str]] | None,
+            Field(
+                description=(
+                    "Optional label filter — map of key → list of allowed values, "
+                    "e.g. {\"project\": [\"clickhouse-commerce-pricing\"]}. Use this to "
+                    "scope the SKU breakdown to one team / project / cluster."
+                )
+            ),
+        ] = None,
+        labels_or_filter_logic: bool = False,
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
         return await _attach_spend_fx(await usage.sku_report(
@@ -322,25 +339,49 @@ def create_server(settings: Settings | None = None) -> tuple[FastMCP, Settings]:
             service_ids=service_ids,
             cloud_ids=cloud_ids,
             folder_ids=folder_ids,
+            resource_ids=resource_ids,
+            labels=labels,
+            labels_or_filter_logic=labels_or_filter_logic,
             aggregation_period=aggregation_period,
         ))
 
     @mcp.tool(
         description=(
-            "Spend broken down by individual cloud resources (VMs, buckets, "
-            "clusters, …). Useful for hunting cost outliers."
+            "Spend for SPECIFIC named cloud resources (VMs, buckets, clusters, …). "
+            "`resource_ids` is REQUIRED — the Usage API rejects a resource report "
+            "without it, so you must already know the resource UUIDs. To break down a "
+            "cluster's cost when you only know its name or labels, use spend_by_label "
+            "or spend_by_sku with a `labels` filter instead. Find resource UUIDs in the "
+            "YC console or via `yc <service> list`."
         )
     )
-    async def spend_by_resource(        from_date: str,
+    async def spend_by_resource(
+        from_date: str,
         to_date: str,
-
+        resource_ids: Annotated[
+            list[str],
+            Field(
+                description=(
+                    "REQUIRED. Resource UUIDs to report on. The Usage API returns "
+                    "INVALID_ARGUMENT for a resource report with no resource_ids — "
+                    "it does not enumerate every resource in the account."
+                )
+            ),
+        ],
         billing_account_id: str | None = None,
-        resource_ids: list[str] | None = None,
         service_ids: list[str] | None = None,
         folder_ids: list[str] | None = None,
         cloud_ids: list[str] | None = None,
         aggregation_period: AggregationPeriod = "MONTH",
     ) -> dict[str, Any]:
+        if not resource_ids:
+            raise ValueError(
+                "spend_by_resource requires a non-empty resource_ids list — the "
+                "Yandex Cloud Usage API rejects a resource report without it. If you "
+                "only know the cluster/resource by name or label, use spend_by_label "
+                'or spend_by_sku with a labels filter (e.g. {"project": ["<name>"]}) '
+                "to break down its cost instead."
+            )
         return await _attach_spend_fx(await usage.resource_report(
             billing_account_id=_resolve_account(billing_account_id),
             from_date=from_date,

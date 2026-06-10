@@ -87,6 +87,7 @@ class UsageClient:
         endpoint: str = "billing.api.cloud.yandex.net:443",
         cache_ttl_seconds: float = 300.0,
         cache_max_entries: int = 256,
+        rpc_timeout_seconds: float = 30.0,
     ) -> None:
         self._auth = token_provider
         self._endpoint = endpoint
@@ -98,6 +99,7 @@ class UsageClient:
         )
         self._cache_ttl = cache_ttl_seconds
         self._cache_max = cache_max_entries
+        self._rpc_timeout = rpc_timeout_seconds
 
     async def _ensure_stub(self) -> ccs_grpc.ConsumptionCoreServiceStub:
         if self._stub is not None:
@@ -184,9 +186,29 @@ class UsageClient:
         rpc = getattr(stub, method)
         token = await self._auth.get_token()
         try:
-            resp = await rpc(req, metadata=(("authorization", f"Bearer {token}"),))
+            resp = await rpc(
+                req,
+                metadata=(("authorization", f"Bearer {token}"),),
+                timeout=self._rpc_timeout,
+            )
         except grpc.aio.AioRpcError as e:
-            raise UsageApiError(e.code(), e.details() or str(e)) from None
+            code = e.code()
+            # An UNFILTERED account-wide label/SKU report can blow past the deadline
+            # (and the response would overflow the caller's token limit anyway).
+            # Turn the opaque DEADLINE/RESOURCE error into an actionable instruction
+            # to narrow the query, rather than a cryptic gRPC failure.
+            if code in (
+                grpc.StatusCode.DEADLINE_EXCEEDED,
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+            ):
+                raise UsageApiError(
+                    code,
+                    f"{method} did not return within {self._rpc_timeout:.0f}s — the "
+                    "query is too broad. Narrow it with a filter (labels / service_ids "
+                    "/ folder_ids / cloud_ids / resource_ids) or a shorter date range / "
+                    "finer aggregation_period, then retry.",
+                ) from None
+            raise UsageApiError(code, e.details() or str(e)) from None
         result = MessageToDict(resp, preserving_proto_field_name=True)
         self._cache_put(key, result)
         return result
