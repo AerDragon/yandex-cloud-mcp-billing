@@ -21,10 +21,11 @@ Tiny helper layer for resolving service IDs that you pass to the spend tools:
 
 ### Spend / consumption (ConsumptionCore gRPC)
 
-Every tool below takes `billing_account_id`, `from_date`, `to_date` (YYYY-MM-DD or
-ISO 8601) and `aggregation_period` (DAY | WEEK | MONTH | QUARTER | YEAR, default
-MONTH). Each returns a three-level structure: totals (cost, credits, expense), the
-per-entity breakdown for the requested dimension, and a time series.
+Most tools below take `from_date`, `to_date` (YYYY-MM-DD or ISO 8601), an optional
+`billing_account_id` (falls back to `YC_BILLING_ACCOUNT_ID`) and `aggregation_period`
+(DAY | WEEK | MONTH | QUARTER | YEAR, default MONTH). The breakdown tools return a
+three-level structure: totals (cost, credits, expense), the per-entity breakdown for
+the requested dimension, and a time series.
 
 | Tool | What it answers |
 | --- | --- |
@@ -32,13 +33,39 @@ per-entity breakdown for the requested dimension, and a time series.
 | `spend_by_service` | "How much did we spend on Compute / S3 / MK8s …?" |
 | `spend_by_cloud` | "Which cloud (tenant) drove the bill?" |
 | `spend_by_folder` | "Which folder / project drove the bill?" |
-| `spend_by_sku` | "Which line items inside this service cost the most?" |
-| `spend_by_resource` | "Which individual VM / bucket / cluster was the outlier?" |
-| `spend_by_label` | "Cost-allocate by resource labels (team, env, …)." |
+| `spend_by_sku` | "Which line items (vCPU / RAM / egress …) cost the most?" Scope it with a `labels` filter, `resource_ids` or `service_ids` — unscoped it returns every SKU in the account. |
+| `spend_by_resource` | "Which individual VM / bucket / cluster was the outlier?" `resource_ids` is **required** — the Usage API rejects a resource report without it. |
+| `list_label_keys` | "Which resource label keys exist, and how concentrated is each?" Returns `[{key, distinct_values, total_cost, high_cardinality}]` — start here to pick a key for the two tools below. |
+| `spend_grouped_by_label` | "Cost per value of ONE label key" — the chargeback workhorse (`label_key="project"` → cost per project, `"team"` → cost per team). Full breakdown, compact rows, sorted by cost. |
+| `spend_by_label` | "Cost for a SPECIFIC label filter" — verbose per-label-value rows. Needs a `labels` filter (`{key: [values]}`) **or** a service/folder/cloud scope. |
 
 These hit the `ConsumptionCoreService` gRPC API, which has a **1-request-per-minute
 per-IP rate limit**. Responses are cached in-process for `YC_USAGE_CACHE_TTL` seconds
 (default 300). Requires the role `billing.accounts.getReport`.
+
+#### Cost allocation by label
+
+The typical chargeback flow is **discover → group → drill down**:
+
+1. `list_label_keys` — see which label keys your resources actually carry (and which
+   are too granular to group by — those come back flagged `high_cardinality`).
+2. `spend_grouped_by_label(label_key="project")` — the full cost-per-value breakdown
+   for one key, sorted descending. This is the answer to "what does each
+   project/team/cluster cost".
+3. `spend_by_label(labels={"project": ["…"]})` — the verbose per-value detail once you
+   know which specific value(s) you care about.
+
+Both label-filtering tools refuse an **unscoped** call: a bare label report would
+enumerate every label key × value in the account (thousands of rows), so you must
+pass either a `labels` filter or a `service_ids` / `folder_ids` / `cloud_ids` scope.
+
+**High-cardinality backstop.** If a `spend_grouped_by_label` result would exceed the
+response budget (`YC_GROUPED_MAX_BYTES`, default 40 000 — sized to stay under a typical
+16K-token tool-output limit), the tool does **not** truncate rows or sample a top-N.
+Instead it returns a `status: "too_many_values_to_list"` summary carrying the complete,
+correct `total` + `value_count` and concrete ways to narrow (group by a coarser key,
+add a scope, or name specific values). Real business keys (project / team / cluster)
+are far smaller and never trip it.
 
 ### Display currency (auto-conversion)
 
